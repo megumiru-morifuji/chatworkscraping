@@ -213,45 +213,62 @@ def scroll_to_load_all_messages(driver):
         ".cw_chat_body",
         "[role='log']",
         ".chatTimeLineContainer",
-        "#_timeLine"
+        "#_timeLine",
+        "[class*='timeline']",
+        "[class*='messageList']"
     ]
     
     for selector in selectors:
         try:
             chat_area = driver.find_element(By.CSS_SELECTOR, selector)
-            print(f"  チャットエリア検出: {selector}")
+            print(f"  ✓ チャットエリア検出: {selector}")
             break
         except:
             continue
     
     if not chat_area:
-        print("⚠️  チャットエリアが見つかりません")
+        print("  ⚠️ チャットエリアが見つかりません")
+        print("  スクロールなしで続行します（最近のメッセージのみ取得）")
+        time.sleep(3)
         return
     
     previous_message_count = 0
     no_change_count = 0
-    max_attempts = 100
+    max_attempts = 200  # 最大スクロール回数を増やす
+    scroll_amount = 1000  # 一度に大きくスクロール
+    
+    print(f"  スクロール開始（最大{max_attempts}回試行）...")
     
     for i in range(max_attempts):
-        messages = driver.find_elements(By.CSS_SELECTOR, "div[data-mid], li[data-mid]")
+        # 現在のメッセージ数を取得
+        messages = driver.find_elements(By.CSS_SELECTOR, "[data-mid]")
         current_count = len(messages)
         
-        # 上方向にスクロール
-        driver.execute_script("arguments[0].scrollTop -= 800", chat_area)
-        time.sleep(1.5)
+        # 一番上にスクロール
+        driver.execute_script("arguments[0].scrollTop = 0", chat_area)
+        time.sleep(1)
         
+        # 変化をチェック
         if current_count == previous_message_count:
             no_change_count += 1
-            if no_change_count >= 3:
-                print(f"✅ 全メッセージ読み込み完了 ({current_count}件)")
+            if no_change_count >= 5:  # 5回変化なしで終了
+                print(f"  ✅ 全メッセージ読み込み完了 ({current_count}件)")
                 break
         else:
             no_change_count = 0
-            if i % 10 == 0:
-                print(f"  {current_count}件のメッセージを検出...")
+            if i % 10 == 0 or current_count != previous_message_count:
+                print(f"    {current_count}件のメッセージを検出中...")
         
         previous_message_count = current_count
+        
+        # 進捗表示
+        if i > 0 and i % 50 == 0:
+            print(f"    スクロール継続中... ({i}/{max_attempts}回)")
     
+    if no_change_count < 5:
+        print(f"  ⚠️ 最大試行回数に達しました ({previous_message_count}件)")
+    
+    # 最後に一番上にスクロール
     driver.execute_script("arguments[0].scrollTop = 0", chat_area)
     time.sleep(2)
 
@@ -260,6 +277,7 @@ def extract_message_data(msg, session, download_dir):
     data = {
         "message_id": None,
         "sender": "Unknown",
+        "company": "",
         "body": "",
         "timestamp": "",
         "attachments": [],
@@ -269,57 +287,82 @@ def extract_message_data(msg, session, download_dir):
     try:
         data["message_id"] = msg.get_attribute("data-mid")
         
-        # 送信者名
+        # 送信者名（新UI対応）
         sender_selectors = [
+            "[data-testid='timeline_user-name']",
+            "p[data-testid='timeline_user-name']",
+            ".sc-iPahhU",
             ".chatTimeLineNameBox__name",
-            ".timeline_chatName",
-            "[data-test='message-sender-name']",
-            "._chatSenderName"
+            "[class*='userName']"
         ]
         for selector in sender_selectors:
             try:
                 sender = msg.find_element(By.CSS_SELECTOR, selector)
-                data["sender"] = sender.text
-                break
+                data["sender"] = sender.text.strip()
+                if data["sender"]:
+                    break
             except:
                 continue
         
-        # メッセージ本文
+        # 会社名・所属（新UI）
+        try:
+            company_elem = msg.find_element(By.CSS_SELECTOR, ".sc-fjhLSj")
+            data["company"] = company_elem.text.strip()
+        except:
+            pass
+        
+        # メッセージ本文（新UI対応）
         body_selectors = [
+            "pre.sc-fbFiXs",
+            "pre span",
+            "pre",
             ".chatTimeLineTxt",
-            ".timeline_message",
-            "[data-test='message-body']",
-            "._message"
+            "[class*='message']"
         ]
         for selector in body_selectors:
             try:
                 body = msg.find_element(By.CSS_SELECTOR, selector)
-                data["body"] = body.text
-                break
+                data["body"] = body.text.strip()
+                if data["body"]:
+                    break
             except:
                 continue
         
-        # タイムスタンプ
+        # タイムスタンプ（新UI対応）
         time_selectors = [
-            ".chatTimeLineTimeBadge__text",
+            "._timeStamp",
+            "[data-tm]",
+            "div[data-tm]",
             "time",
-            ".timeline_time",
-            "._timeStamp"
+            "[datetime]"
         ]
         for selector in time_selectors:
             try:
                 time_elem = msg.find_element(By.CSS_SELECTOR, selector)
-                data["timestamp"] = time_elem.get_attribute("datetime") or time_elem.text
-                break
+                # data-tm属性（UNIXタイムスタンプ）も取得
+                data_tm = time_elem.get_attribute("data-tm")
+                datetime_attr = time_elem.get_attribute("datetime")
+                text = time_elem.text.strip()
+                
+                # 優先順位: datetime > data-tm > テキスト
+                if datetime_attr:
+                    data["timestamp"] = datetime_attr
+                elif data_tm:
+                    data["timestamp"] = f"unix:{data_tm}"
+                elif text:
+                    data["timestamp"] = text
+                
+                if data["timestamp"]:
+                    break
             except:
                 continue
         
         # 添付ファイルの検出とダウンロード
         file_selectors = [
+            "a[download]",
+            "[class*='file']",
             ".cw_message_file",
-            ".timeline_file",
-            "[data-test='message-file']",
-            "a[download]"
+            "a[href*='storage.chatwork.com']"
         ]
         
         for selector in file_selectors:
@@ -327,10 +370,9 @@ def extract_message_data(msg, session, download_dir):
                 files = msg.find_elements(By.CSS_SELECTOR, selector)
                 for file_elem in files:
                     file_url = file_elem.get_attribute("href") or file_elem.get_attribute("data-url")
-                    file_name = file_elem.text or file_elem.get_attribute("download") or "unknown_file"
+                    file_name = file_elem.text.strip() or file_elem.get_attribute("download") or file_elem.get_attribute("title") or "unknown_file"
                     
-                    if file_url:
-                        # ファイルをダウンロード
+                    if file_url and 'storage.chatwork.com' in file_url:
                         local_path = download_file(session, file_url, download_dir, file_name)
                         
                         data["attachments"].append({
@@ -344,14 +386,14 @@ def extract_message_data(msg, session, download_dir):
         
         # 画像の検出とダウンロード
         try:
-            images = msg.find_elements(By.CSS_SELECTOR, "img[src*='storage.chatwork.com'], .timeline_image img")
+            images = msg.find_elements(By.CSS_SELECTOR, "img[src*='storage.chatwork.com'], img[src*='appdata.chatwork.com']")
             for i, img in enumerate(images):
                 img_url = img.get_attribute("src")
-                if img_url:
-                    # URLからファイル名を抽出
-                    parsed_url = urlparse(img_url)
-                    img_name = unquote(os.path.basename(parsed_url.path)) or f"image_{i}.jpg"
-                    
+                alt_text = img.get_attribute("alt")
+                
+                # アバター画像は除外
+                if img_url and 'avatar' not in img_url and 'ico_default' not in img_url:
+                    img_name = alt_text or f"image_{data['message_id']}_{i}.jpg"
                     local_path = download_file(session, img_url, download_dir, img_name)
                     
                     data["attachments"].append({
@@ -365,7 +407,7 @@ def extract_message_data(msg, session, download_dir):
         
         # タスク判定
         try:
-            msg.find_element(By.CSS_SELECTOR, "[data-test='task-icon'], .taskIcon")
+            msg.find_element(By.CSS_SELECTOR, "[data-test='task-icon'], .taskIcon, [class*='task']")
             data["is_task"] = True
         except:
             pass
@@ -380,22 +422,47 @@ def export_room_messages(driver, room_url, session, base_download_dir):
     driver.get(room_url)
     time.sleep(4)
     
-    # ルーム名とIDを取得
+    # ルームIDを取得
     room_id = room_url.split("rid")[-1]
     room_name = f"Room_{room_id}"
     
-    try:
-        room_name_elem = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "._roomName, .room_name, [data-test='room-name']"))
-        )
-        room_name = room_name_elem.text or room_name
-    except:
-        print("⚠️  ルーム名を取得できませんでした")
+    # ルーム名を取得（ヘッダー部分から）
+    room_name_selectors = [
+        ".chatRoomHeader__roomTitle",  # 新UI
+        "span.chatRoomHeader__roomTitle",
+        "._roomName",
+        ".room_name",
+        "[data-test='room-name']",
+        "[data-testid='room-name']",
+        "h1[class*='room']"
+    ]
     
-    print(f"\n📁 ルーム: {room_name} (ID: {room_id})")
+    try:
+        # ページ上部のヘッダーからルーム名を探す
+        for selector in room_name_selectors:
+            try:
+                room_name_elem = WebDriverWait(driver, 8).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                )
+                name = room_name_elem.text.strip()
+                if name:
+                    room_name = name
+                    break
+            except:
+                continue
+        
+        print(f"\n📁 ルーム: {room_name} (ID: {room_id})")
+    
+    except Exception as e:
+        print(f"\n📁 ルーム: {room_name} (ID: {room_id})")
+        print(f"  ⚠️ ルーム名取得失敗: {e}")
+    
+    # ファイル名用に安全な文字列に変換
+    safe_room_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in room_name)
+    safe_room_name = safe_room_name.strip()[:50]  # 最大50文字
     
     # このルーム専用のダウンロードディレクトリ
-    download_dir = Path(base_download_dir) / f"room_{room_id}_{room_name.replace('/', '_')}"
+    download_dir = Path(base_download_dir) / f"{room_id}_{safe_room_name}"
     download_dir.mkdir(parents=True, exist_ok=True)
     
     # 全メッセージを読み込み
@@ -477,12 +544,16 @@ def main():
             if room_data:
                 all_exports.append(room_data)
                 
+                # ファイル名用に安全な文字列を作成
+                safe_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in room_data['room_name'])
+                safe_name = safe_name.strip()[:50]
+                
                 # ルームごとに個別保存
-                filename = Path(BASE_DOWNLOAD_DIR) / f"room_{room_data['room_id']}_messages.json"
+                filename = Path(BASE_DOWNLOAD_DIR) / f"{room_data['room_id']}_{safe_name}.json"
                 with open(filename, "w", encoding="utf-8") as f:
                     json.dump(room_data, f, ensure_ascii=False, indent=2)
                 
-                print(f"✅ {filename} に保存しました")
+                print(f"✅ {filename.name} に保存しました")
             
             time.sleep(3)
         
