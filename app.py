@@ -9,6 +9,7 @@ import requests
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, unquote
+import re
 
 def login_chatwork(driver):
     """Chatworkにログイン（手動）"""
@@ -181,41 +182,56 @@ def get_session_cookies(driver):
     for cookie in selenium_cookies:
         session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain'))
     
+    # User-Agentも設定
+    session.headers.update({
+        'User-Agent': driver.execute_script("return navigator.userAgent;"),
+        'Referer': 'https://www.chatwork.com/'
+    })
+    
     return session
 
-def download_file(session, url, save_dir, filename):
-    """添付ファイルをダウンロード"""
+def download_file_from_chatwork(session, file_url, filename, save_dir):
+    """Chatworkからファイルをダウンロード（相対パス対応）"""
     try:
-        save_path = Path(save_dir) / filename
+        # 相対パスを絶対パスに変換
+        if file_url.startswith('gateway/'):
+            file_url = f"https://www.chatwork.com/{file_url}"
+        
+        # ファイル名をサニタイズ（Windowsで使えない文字を除去）
+        safe_filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        
+        save_path = Path(save_dir) / safe_filename
         save_path.parent.mkdir(parents=True, exist_ok=True)
         
-        response = session.get(url, stream=True, timeout=30)
+        response = session.get(file_url, stream=True, timeout=30)
         response.raise_for_status()
         
         with open(save_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         
-        print(f"    ✓ ダウンロード: {filename}")
-        return str(save_path)
+        # 絶対パスを返す
+        absolute_path = str(save_path.resolve())
+        print(f"    ✓ ダウンロード: {safe_filename}")
+        return absolute_path
     except Exception as e:
         print(f"    ✗ ダウンロード失敗 ({filename}): {e}")
         return None
 
 def scroll_to_load_all_messages(driver):
-    """チャット履歴を全て読み込むまでスクロール"""
+    """チャット履歴を全て読み込むまでスクロール（遅延ロード対応）"""
     print("📜 過去のメッセージを読み込み中...")
     
     # チャットエリアを特定
     chat_area = None
     selectors = [
+        "div.sc-eBAZHg.kzmpjh",
+        "div[tabindex='1']",
         "#_chatText",
         ".cw_chat_body",
         "[role='log']",
         ".chatTimeLineContainer",
-        "#_timeLine",
-        "[class*='timeline']",
-        "[class*='messageList']"
+        "#_timeLine"
     ]
     
     for selector in selectors:
@@ -234,46 +250,47 @@ def scroll_to_load_all_messages(driver):
     
     previous_message_count = 0
     no_change_count = 0
-    max_attempts = 200  # 最大スクロール回数を増やす
-    scroll_amount = 1000  # 一度に大きくスクロール
+    max_attempts = 300
+    wait_time = 2.5
     
     print(f"  スクロール開始（最大{max_attempts}回試行）...")
     
     for i in range(max_attempts):
-        # 現在のメッセージ数を取得
         messages = driver.find_elements(By.CSS_SELECTOR, "[data-mid]")
         current_count = len(messages)
         
-        # 一番上にスクロール
         driver.execute_script("arguments[0].scrollTop = 0", chat_area)
-        time.sleep(1)
+        time.sleep(wait_time)
         
-        # 変化をチェック
-        if current_count == previous_message_count:
+        messages_after_wait = driver.find_elements(By.CSS_SELECTOR, "[data-mid]")
+        count_after_wait = len(messages_after_wait)
+        
+        if count_after_wait == previous_message_count:
             no_change_count += 1
-            if no_change_count >= 5:  # 5回変化なしで終了
-                print(f"  ✅ 全メッセージ読み込み完了 ({current_count}件)")
+            print(f"    変化なし {no_change_count}/7 ({count_after_wait}件)")
+            if no_change_count >= 7:
+                print(f"  ✅ 全メッセージ読み込み完了 ({count_after_wait}件)")
                 break
         else:
             no_change_count = 0
-            if i % 10 == 0 or current_count != previous_message_count:
-                print(f"    {current_count}件のメッセージを検出中...")
+            print(f"    {count_after_wait}件のメッセージを検出（+{count_after_wait - previous_message_count}件）")
         
-        previous_message_count = current_count
+        previous_message_count = count_after_wait
         
-        # 進捗表示
-        if i > 0 and i % 50 == 0:
-            print(f"    スクロール継続中... ({i}/{max_attempts}回)")
+        if i > 0 and i % 20 == 0:
+            print(f"    継続中... {i}/{max_attempts}回 ({count_after_wait}件)")
     
-    if no_change_count < 5:
-        print(f"  ⚠️ 最大試行回数に達しました ({previous_message_count}件)")
+    if no_change_count < 7:
+        print(f"  ⚠️ 最大試行回数に達しました ({previous_message_count}件取得）")
     
-    # 最後に一番上にスクロール
     driver.execute_script("arguments[0].scrollTop = 0", chat_area)
     time.sleep(2)
+    
+    final_count = len(driver.find_elements(By.CSS_SELECTOR, "[data-mid]"))
+    print(f"  📊 最終取得件数: {final_count}件")
 
 def extract_message_data(msg, session, download_dir):
-    """個別メッセージからデータを抽出"""
+    """個別メッセージからデータを抽出（画像・ファイル・フォルダ完全対応）"""
     data = {
         "message_id": None,
         "sender": "Unknown",
@@ -287,7 +304,7 @@ def extract_message_data(msg, session, download_dir):
     try:
         data["message_id"] = msg.get_attribute("data-mid")
         
-        # 送信者名（新UI対応）
+        # 送信者名
         sender_selectors = [
             "[data-testid='timeline_user-name']",
             "p[data-testid='timeline_user-name']",
@@ -304,14 +321,14 @@ def extract_message_data(msg, session, download_dir):
             except:
                 continue
         
-        # 会社名・所属（新UI）
+        # 会社名
         try:
             company_elem = msg.find_element(By.CSS_SELECTOR, ".sc-fjhLSj")
             data["company"] = company_elem.text.strip()
         except:
             pass
         
-        # メッセージ本文（新UI対応）
+        # メッセージ本文
         body_selectors = [
             "pre.sc-fbFiXs",
             "pre span",
@@ -328,7 +345,7 @@ def extract_message_data(msg, session, download_dir):
             except:
                 continue
         
-        # タイムスタンプ（新UI対応）
+        # タイムスタンプ
         time_selectors = [
             "._timeStamp",
             "[data-tm]",
@@ -339,12 +356,10 @@ def extract_message_data(msg, session, download_dir):
         for selector in time_selectors:
             try:
                 time_elem = msg.find_element(By.CSS_SELECTOR, selector)
-                # data-tm属性（UNIXタイムスタンプ）も取得
                 data_tm = time_elem.get_attribute("data-tm")
                 datetime_attr = time_elem.get_attribute("datetime")
                 text = time_elem.text.strip()
                 
-                # 優先順位: datetime > data-tm > テキスト
                 if datetime_attr:
                     data["timestamp"] = datetime_attr
                 elif data_tm:
@@ -357,53 +372,122 @@ def extract_message_data(msg, session, download_dir):
             except:
                 continue
         
-        # 添付ファイルの検出とダウンロード
-        file_selectors = [
-            "a[download]",
-            "[class*='file']",
-            ".cw_message_file",
-            "a[href*='storage.chatwork.com']"
-        ]
-        
-        for selector in file_selectors:
-            try:
-                files = msg.find_elements(By.CSS_SELECTOR, selector)
-                for file_elem in files:
-                    file_url = file_elem.get_attribute("href") or file_elem.get_attribute("data-url")
-                    file_name = file_elem.text.strip() or file_elem.get_attribute("download") or file_elem.get_attribute("title") or "unknown_file"
-                    
-                    if file_url and 'storage.chatwork.com' in file_url:
-                        local_path = download_file(session, file_url, download_dir, file_name)
-                        
-                        data["attachments"].append({
-                            "type": "file",
-                            "filename": file_name,
-                            "url": file_url,
-                            "local_path": local_path
-                        })
-            except:
-                pass
-        
-        # 画像の検出とダウンロード
+        # ★★★ 1. 画像プレビューの検出（data-file-id対応）★★★
         try:
-            images = msg.find_elements(By.CSS_SELECTOR, "img[src*='storage.chatwork.com'], img[src*='appdata.chatwork.com']")
-            for i, img in enumerate(images):
-                img_url = img.get_attribute("src")
-                alt_text = img.get_attribute("alt")
+            preview_images = msg.find_elements(By.CSS_SELECTOR, "img[data-file-id]._filePreview")
+            
+            for i, img in enumerate(preview_images):
+                file_id = img.get_attribute("data-file-id")
+                src = img.get_attribute("src")
                 
-                # アバター画像は除外
-                if img_url and 'avatar' not in img_url and 'ico_default' not in img_url:
-                    img_name = alt_text or f"image_{data['message_id']}_{i}.jpg"
-                    local_path = download_file(session, img_url, download_dir, img_name)
-                    
+                print(f"    🖼️ 画像プレビュー検出: file_id={file_id}")
+                
+                # ファイル名を生成
+                filename = f"image_{data['message_id']}_{file_id}.jpg"
+                
+                # 相対パスを絶対URLに変換
+                if src and src.startswith('gateway/'):
+                    src = f"https://www.chatwork.com/{src}"
+                
+                # ダウンロード
+                local_path = download_file_from_chatwork(session, src, filename, download_dir)
+                
+                if local_path:
                     data["attachments"].append({
-                        "type": "image",
-                        "filename": img_name,
-                        "url": img_url,
-                        "local_path": local_path
+                        "type": "image_preview",
+                        "file_id": file_id,
+                        "filename": filename,
+                        "chatwork_url": src,
+                        "local_absolute_path": local_path
                     })
-        except:
-            pass
+        except Exception as e:
+            print(f"    ⚠️ 画像プレビュー取得エラー: {e}")
+        
+        # ★★★ 2. ファイルダウンロードリンクの検出 ★★★
+        # パターン: <a href="gateway/download_file.php?bin=1&file_id=xxx&preview=0">filename.docx (217.83 KB)</a>
+        try:
+            # data-cwopen属性を持つdiv内のaタグを探す
+            file_links = msg.find_elements(By.CSS_SELECTOR, "div[data-cwopen*='download'] a[href*='gateway/download_file.php']")
+            
+            for link in file_links:
+                href = link.get_attribute("href")
+                link_text = link.text.strip()
+                
+                # file_idを抽出
+                file_id_match = re.search(r'file_id=(\d+)', href)
+                file_id = file_id_match.group(1) if file_id_match else "unknown"
+                
+                # ファイル名とサイズを分離（例: "filename.docx (217.83 KB)"）
+                filename_match = re.match(r'(.+?)\s*\([\d.]+\s*[KMGT]?B\)', link_text)
+                if filename_match:
+                    filename = filename_match.group(1).strip()
+                else:
+                    filename = link_text or f"file_{file_id}"
+                
+                print(f"    📎 ファイル検出: {filename} (file_id={file_id})")
+                
+                # 相対パスを絶対URLに変換
+                if href.startswith('gateway/'):
+                    href = f"https://www.chatwork.com/{href}"
+                
+                # ダウンロード
+                local_path = download_file_from_chatwork(session, href, filename, download_dir)
+                
+                if local_path:
+                    data["attachments"].append({
+                        "type": "file",
+                        "file_id": file_id,
+                        "filename": filename,
+                        "chatwork_url": href,
+                        "local_absolute_path": local_path
+                    })
+        except Exception as e:
+            print(f"    ⚠️ ファイルリンク取得エラー: {e}")
+        
+        # ★★★ 3. フォルダ（storage.chatwork.com）の検出 ★★★
+        try:
+            storage_links = msg.find_elements(By.CSS_SELECTOR, "a[href*='storage.chatwork.com']")
+            
+            for link in storage_links:
+                href = link.get_attribute("href")
+                link_text = link.text.strip()
+                title = link.get_attribute("title")
+                download_attr = link.get_attribute("download")
+                
+                # アバター画像を除外
+                if 'avatar' in href or 'ico_default' in href:
+                    continue
+                
+                # ファイル名を取得（優先順位: download属性 > title > リンクテキスト）
+                filename = download_attr or title or link_text
+                
+                # ファイル名がない場合はURLから生成
+                if not filename or filename == "":
+                    filename = f"storage_file_{data['message_id']}"
+                    # URLから拡張子を推測
+                    if '.png' in href or '.jpg' in href or '.jpeg' in href:
+                        filename += '.jpg'
+                    elif '.pdf' in href:
+                        filename += '.pdf'
+                    elif '.xlsx' in href or '.xls' in href:
+                        filename += '.xlsx'
+                    elif '.docx' in href:
+                        filename += '.docx'
+                
+                print(f"    📁 ストレージファイル検出: {filename}")
+                
+                # ダウンロード
+                local_path = download_file_from_chatwork(session, href, filename, download_dir)
+                
+                if local_path:
+                    data["attachments"].append({
+                        "type": "storage_file",
+                        "filename": filename,
+                        "chatwork_url": href,
+                        "local_absolute_path": local_path
+                    })
+        except Exception as e:
+            print(f"    ⚠️ ストレージファイル取得エラー: {e}")
         
         # タスク判定
         try:
@@ -414,6 +498,8 @@ def extract_message_data(msg, session, download_dir):
         
     except Exception as e:
         print(f"  ⚠️  メッセージ解析エラー: {e}")
+        import traceback
+        traceback.print_exc()
     
     return data
 
@@ -422,13 +508,12 @@ def export_room_messages(driver, room_url, session, base_download_dir):
     driver.get(room_url)
     time.sleep(4)
     
-    # ルームIDを取得
     room_id = room_url.split("rid")[-1]
     room_name = f"Room_{room_id}"
     
-    # ルーム名を取得（ヘッダー部分から）
+    # ルーム名を取得
     room_name_selectors = [
-        ".chatRoomHeader__roomTitle",  # 新UI
+        ".chatRoomHeader__roomTitle",
         "span.chatRoomHeader__roomTitle",
         "._roomName",
         ".room_name",
@@ -438,7 +523,6 @@ def export_room_messages(driver, room_url, session, base_download_dir):
     ]
     
     try:
-        # ページ上部のヘッダーからルーム名を探す
         for selector in room_name_selectors:
             try:
                 room_name_elem = WebDriverWait(driver, 8).until(
@@ -459,7 +543,7 @@ def export_room_messages(driver, room_url, session, base_download_dir):
     
     # ファイル名用に安全な文字列に変換
     safe_room_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in room_name)
-    safe_room_name = safe_room_name.strip()[:50]  # 最大50文字
+    safe_room_name = safe_room_name.strip()[:50]
     
     # このルーム専用のダウンロードディレクトリ
     download_dir = Path(base_download_dir) / f"{room_id}_{safe_room_name}"
@@ -502,7 +586,7 @@ def export_room_messages(driver, room_url, session, base_download_dir):
         "room_url": room_url,
         "export_date": datetime.now().isoformat(),
         "total_messages": len(extracted_messages),
-        "download_directory": str(download_dir),
+        "download_directory": str(download_dir.resolve()),
         "messages": extracted_messages
     }
 
@@ -564,8 +648,8 @@ def main():
         
         print(f"\n{'='*60}")
         print(f"✅ 全ルームのエクスポート完了")
-        print(f"   統合ファイル: {master_filename}")
-        print(f"   ダウンロード先: {BASE_DOWNLOAD_DIR}/")
+        print(f"   統合ファイル: {master_filename.resolve()}")
+        print(f"   ダウンロード先: {Path(BASE_DOWNLOAD_DIR).resolve()}/")
         print(f"   処理ルーム数: {len(all_exports)}")
         print(f"{'='*60}")
         
