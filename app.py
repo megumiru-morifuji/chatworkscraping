@@ -503,6 +503,16 @@ def extract_message_data(msg, session, download_dir):
     
     return data
 
+def is_room_already_processed(room_id, room_name, base_download_dir):
+    """★★★ ルームが既に処理済みか確認 ★★★"""
+    safe_room_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in room_name)
+    safe_room_name = safe_room_name.strip()[:50]
+    
+    # JSONファイルが存在するか確認
+    filename = Path(base_download_dir) / f"{room_id}_{safe_room_name}.json"
+    
+    return filename.exists(), filename
+
 def export_room_messages(driver, room_url, session, base_download_dir):
     """特定ルームの全メッセージを取得"""
     driver.get(room_url)
@@ -540,6 +550,14 @@ def export_room_messages(driver, room_url, session, base_download_dir):
     except Exception as e:
         print(f"\n📁 ルーム: {room_name} (ID: {room_id})")
         print(f"  ⚠️ ルーム名取得失敗: {e}")
+    
+    # ★★★ 処理済みチェック ★★★
+    already_processed, json_file = is_room_already_processed(room_id, room_name, base_download_dir)
+    if already_processed:
+        print(f"⏭️  スキップ: このルームは既に処理済みです")
+        print(f"   ファイル: {json_file.name}")
+        print(f"   💡 再処理したい場合はこのファイルを削除してください")
+        return None
     
     # ファイル名用に安全な文字列に変換
     safe_room_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in room_name)
@@ -618,6 +636,8 @@ def main():
         
         # 各ルームのメッセージを取得
         all_exports = []
+        skipped_count = 0
+        
         for i, room_url in enumerate(room_urls, 1):
             print(f"\n{'='*60}")
             print(f"ルーム {i}/{len(room_urls)} を処理中")
@@ -638,20 +658,29 @@ def main():
                     json.dump(room_data, f, ensure_ascii=False, indent=2)
                 
                 print(f"✅ {filename.name} に保存しました")
+            else:
+                skipped_count += 1
             
             time.sleep(3)
         
         # 全ルームをまとめて保存
-        master_filename = Path(BASE_DOWNLOAD_DIR) / f"_all_rooms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(master_filename, "w", encoding="utf-8") as f:
-            json.dump(all_exports, f, ensure_ascii=False, indent=2)
-        
-        print(f"\n{'='*60}")
-        print(f"✅ 全ルームのエクスポート完了")
-        print(f"   統合ファイル: {master_filename.resolve()}")
-        print(f"   ダウンロード先: {Path(BASE_DOWNLOAD_DIR).resolve()}/")
-        print(f"   処理ルーム数: {len(all_exports)}")
-        print(f"{'='*60}")
+        if all_exports:
+            master_filename = Path(BASE_DOWNLOAD_DIR) / f"_all_rooms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(master_filename, "w", encoding="utf-8") as f:
+                json.dump(all_exports, f, ensure_ascii=False, indent=2)
+            
+            print(f"\n{'='*60}")
+            print(f"✅ 全ルームのエクスポート完了")
+            print(f"   統合ファイル: {master_filename.resolve()}")
+            print(f"   ダウンロード先: {Path(BASE_DOWNLOAD_DIR).resolve()}/")
+            print(f"   処理ルーム数: {len(all_exports)}")
+            print(f"   スキップ数: {skipped_count}")
+            print(f"{'='*60}")
+        else:
+            print(f"\n{'='*60}")
+            print(f"✅ 全ルーム確認完了")
+            print(f"   全て処理済みでした（スキップ: {skipped_count}）")
+            print(f"{'='*60}")
         
     except Exception as e:
         print(f"\n❌ エラーが発生しました: {e}")
