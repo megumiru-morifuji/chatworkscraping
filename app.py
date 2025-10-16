@@ -9,8 +9,9 @@ import requests
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, unquote
+import re
 
-# フィルター対象のキーワード
+# ★★★ フィルター対象のキーワード ★★★
 TARGET_KEYWORDS = [
     "吉田", "金森", "藤田", "原", "プログラミングチーム", "加藤", 
     "野坂", "森田", "大谷", "村上", "斎藤", "備品発注管理", "北館", 
@@ -18,12 +19,33 @@ TARGET_KEYWORDS = [
     "藤原", "堀田"
 ]
 
-def should_process_room(room_name):
-    """ルーム名が対象キーワードを含むかチェック"""
+def check_session_valid(driver):
+    """セッションが有効か確認"""
+    try:
+        driver.get("https://www.chatwork.com/")
+        time.sleep(2)
+        # ログイン画面にリダイレクトされたらセッション切れ
+        if "login" in driver.current_url.lower():
+            return False
+        return True
+    except:
+        return False
+
+def relogin_if_needed(driver, session):
+    """セッション切れ時に再ログイン"""
+    if not check_session_valid(driver):
+        print("\n⚠️  セッションが切れています。再ログインしてください...")
+        login_chatwork(driver)
+        new_session = get_session_cookies(driver)
+        return new_session
+    return session
+
+def is_room_target(room_name):
+    """★★★ ルーム名がターゲットキーワードに含まれているか確認 ★★★"""
     for keyword in TARGET_KEYWORDS:
         if keyword in room_name:
-            return True, keyword
-    return False, None
+            return True
+    return False
 
 def login_chatwork(driver):
     """Chatworkにログイン（手動）"""
@@ -101,8 +123,8 @@ def get_all_room_urls(driver):
         except:
             continue
     
-    # data-rid からURLとルーム名を取得
-    room_data = []
+    # data-rid からURLを生成
+    room_urls = set()
     
     if room_elements:
         for elem in room_elements:
@@ -110,24 +132,18 @@ def get_all_room_urls(driver):
             if rid:
                 # ChatworkのURL形式でURLを生成
                 room_url = f"https://www.chatwork.com/#!rid{rid}"
+                room_urls.add(room_url)
                 
-                # ルーム名を取得
-                room_name = "Unknown"
+                # ルーム名も取得（デバッグ用）
                 try:
                     label = elem.get_attribute("aria-label")
                     if label:
-                        room_name = label
+                        print(f"    - {label[:30]} (rid{rid})")
                 except:
                     pass
-                
-                room_data.append({
-                    "url": room_url,
-                    "name": room_name,
-                    "rid": rid
-                })
     
     # 旧UIにも対応（念のため）
-    if not room_data:
+    if not room_urls:
         print("\n  旧UI形式も試行中...")
         old_selectors = [
             "a[href*='#!rid']",
@@ -142,50 +158,57 @@ def get_all_room_urls(driver):
                     print(f"    ✓ {selector}: {len(links)}個検出")
                     for link in links:
                         href = link.get_attribute("href")
-                        name = link.text.strip() or "Unknown"
                         if href and "rid" in href:
-                            rid = href.split("rid")[-1]
-                            room_data.append({
-                                "url": href,
-                                "name": name,
-                                "rid": rid
-                            })
+                            room_urls.add(href)
             except:
                 continue
     
     # 手動入力モードへのフォールバック
-    if not room_data:
+    if not room_urls:
         print("\n❌ 自動検出できませんでした")
-        return []
-    
-    # フィルタリング処理
-    print(f"\n📊 合計 {len(room_data)}個のルームを検出")
-    print(f"\n🔍 対象キーワードでフィルタリング中...")
-    print(f"   キーワード: {', '.join(TARGET_KEYWORDS)}")
-    
-    filtered_rooms = []
-    skipped_rooms = []
-    
-    for room in room_data:
-        should_process, matched_keyword = should_process_room(room["name"])
-        if should_process:
-            filtered_rooms.append(room)
-            print(f"  ✓ [{matched_keyword}] {room['name'][:40]} (rid{room['rid']})")
+        print("\n📋 手動モード: ルームURLまたはルームIDを入力してください")
+        print("   例1: https://www.chatwork.com/#!rid374988330")
+        print("   例2: 374988330 (IDのみでもOK)")
+        print("   複数ある場合はカンマ区切り、完了したら空行でEnter\n")
+        
+        manual_urls = []
+        while True:
+            user_input = input("ルームURL/ID（終了は空Enter）>> ").strip()
+            if not user_input:
+                break
+            
+            # カンマ区切りに対応
+            for item in user_input.split(','):
+                item = item.strip()
+                if not item:
+                    continue
+                
+                # URLかIDかを判定
+                if 'http' in item or '#!rid' in item:
+                    # URL形式
+                    if 'rid' in item:
+                        manual_urls.append(item)
+                else:
+                    # ID形式（数字のみ）
+                    if item.isdigit():
+                        manual_urls.append(f"https://www.chatwork.com/#!rid{item}")
+        
+        if manual_urls:
+            room_urls = set(manual_urls)
+            print(f"\n✅ 手動で{len(room_urls)}個のルームを登録しました")
         else:
-            skipped_rooms.append(room)
+            print("\n❌ ルームURLが入力されませんでした")
+            return []
     
-    print(f"\n✅ 対象ルーム: {len(filtered_rooms)}個")
-    print(f"⏭️  スキップ: {len(skipped_rooms)}個")
+    room_urls = list(room_urls)
+    print(f"\n✅ 合計 {len(room_urls)}個のルームを検出しました")
     
-    if len(filtered_rooms) == 0:
-        print("\n⚠️  対象ルームが見つかりませんでした")
-        print("\nスキップされたルーム一覧:")
-        for room in skipped_rooms[:20]:
-            print(f"    - {room['name'][:50]}")
-        if len(skipped_rooms) > 20:
-            print(f"    ... 他 {len(skipped_rooms) - 20} 件")
+    for i, url in enumerate(room_urls[:10], 1):
+        print(f"  {i}. {url}")
+    if len(room_urls) > 10:
+        print(f"  ... 他 {len(room_urls) - 10} 件")
     
-    return [room["url"] for room in filtered_rooms]
+    return room_urls
 
 def get_session_cookies(driver):
     """SeleniumのCookieをrequestsセッションに転送"""
@@ -195,41 +218,38 @@ def get_session_cookies(driver):
     for cookie in selenium_cookies:
         session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain'))
     
+    # User-Agentも設定
+    session.headers.update({
+        'User-Agent': driver.execute_script("return navigator.userAgent;"),
+        'Referer': 'https://www.chatwork.com/'
+    })
+    
     return session
 
-def refresh_session(driver):
-    """セッションを更新してタイムアウトを防ぐ"""
+def download_file_from_chatwork(session, file_url, filename, save_dir):
+    """Chatworkからファイルをダウンロード（相対パス対応）"""
     try:
-        # 現在のURLを保存
-        current_url = driver.current_url
+        # 相対パスを絶対パスに変換
+        if file_url.startswith('gateway/'):
+            file_url = f"https://www.chatwork.com/{file_url}"
         
-        # トップページに移動してセッション更新
-        driver.get("https://www.chatwork.com/")
-        time.sleep(2)
+        # ファイル名をサニタイズ（Windowsで使えない文字を除去）
+        safe_filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
         
-        # 元のページに戻る
-        driver.get(current_url)
-        time.sleep(2)
-        
-        print("  🔄 セッション更新完了")
-    except Exception as e:
-        print(f"  ⚠️  セッション更新エラー: {e}")
-
-def download_file(session, url, save_dir, filename):
-    """添付ファイルをダウンロード"""
-    try:
-        save_path = Path(save_dir) / filename
+        save_path = Path(save_dir) / safe_filename
         save_path.parent.mkdir(parents=True, exist_ok=True)
         
-        response = session.get(url, stream=True, timeout=30)
+        response = session.get(file_url, stream=True, timeout=30)
         response.raise_for_status()
         
         with open(save_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         
-        print(f"    ✓ ダウンロード: {filename}")
-        return str(save_path)
+        # 絶対パスを返す
+        absolute_path = str(save_path.resolve())
+        print(f"    ✓ ダウンロード: {safe_filename}")
+        return absolute_path
     except Exception as e:
         print(f"    ✗ ダウンロード失敗 ({filename}): {e}")
         return None
@@ -266,18 +286,12 @@ def scroll_to_load_all_messages(driver):
     
     previous_message_count = 0
     no_change_count = 0
-    max_attempts = 300
+    max_attempts = 100
     wait_time = 2.5
-    session_refresh_interval = 50  # 50回ごとにセッション更新
     
     print(f"  スクロール開始（最大{max_attempts}回試行）...")
     
     for i in range(max_attempts):
-        # 定期的にセッション更新
-        if i > 0 and i % session_refresh_interval == 0:
-            print(f"  ⏱️  長時間処理中 - セッション更新...")
-            refresh_session(driver)
-        
         messages = driver.find_elements(By.CSS_SELECTOR, "[data-mid]")
         current_count = len(messages)
         
@@ -311,8 +325,8 @@ def scroll_to_load_all_messages(driver):
     final_count = len(driver.find_elements(By.CSS_SELECTOR, "[data-mid]"))
     print(f"  📊 最終取得件数: {final_count}件")
 
-def extract_message_data(msg, session, download_dir, driver):
-    """個別メッセージからデータを抽出"""
+def extract_message_data(msg, session, download_dir):
+    """個別メッセージからデータを抽出（画像・ファイル・フォルダ完全対応）"""
     data = {
         "message_id": None,
         "sender": "Unknown",
@@ -324,17 +338,9 @@ def extract_message_data(msg, session, download_dir, driver):
     }
     
     try:
-        # message_idを取得してから、以降はこのIDで要素を再取得
         data["message_id"] = msg.get_attribute("data-mid")
         
-        # 要素が無効になった場合に備えて、message_idで再検索する関数
-        def get_fresh_element():
-            try:
-                return driver.find_element(By.CSS_SELECTOR, f"[data-mid='{data['message_id']}']")
-            except:
-                return msg  # 見つからない場合は元の要素を返す
-        
-        # 送信者名（新UI対応）
+        # 送信者名
         sender_selectors = [
             "[data-testid='timeline_user-name']",
             "p[data-testid='timeline_user-name']",
@@ -344,23 +350,21 @@ def extract_message_data(msg, session, download_dir, driver):
         ]
         for selector in sender_selectors:
             try:
-                fresh_msg = get_fresh_element()
-                sender = fresh_msg.find_element(By.CSS_SELECTOR, selector)
+                sender = msg.find_element(By.CSS_SELECTOR, selector)
                 data["sender"] = sender.text.strip()
                 if data["sender"]:
                     break
             except:
                 continue
         
-        # 会社名・所属（新UI）
+        # 会社名
         try:
-            fresh_msg = get_fresh_element()
-            company_elem = fresh_msg.find_element(By.CSS_SELECTOR, ".sc-fjhLSj")
+            company_elem = msg.find_element(By.CSS_SELECTOR, ".sc-fjhLSj")
             data["company"] = company_elem.text.strip()
         except:
             pass
         
-        # メッセージ本文（新UI対応）
+        # メッセージ本文
         body_selectors = [
             "pre.sc-fbFiXs",
             "pre span",
@@ -370,15 +374,14 @@ def extract_message_data(msg, session, download_dir, driver):
         ]
         for selector in body_selectors:
             try:
-                fresh_msg = get_fresh_element()
-                body = fresh_msg.find_element(By.CSS_SELECTOR, selector)
+                body = msg.find_element(By.CSS_SELECTOR, selector)
                 data["body"] = body.text.strip()
                 if data["body"]:
                     break
             except:
                 continue
         
-        # タイムスタンプ（新UI対応）
+        # タイムスタンプ
         time_selectors = [
             "._timeStamp",
             "[data-tm]",
@@ -388,8 +391,7 @@ def extract_message_data(msg, session, download_dir, driver):
         ]
         for selector in time_selectors:
             try:
-                fresh_msg = get_fresh_element()
-                time_elem = fresh_msg.find_element(By.CSS_SELECTOR, selector)
+                time_elem = msg.find_element(By.CSS_SELECTOR, selector)
                 data_tm = time_elem.get_attribute("data-tm")
                 datetime_attr = time_elem.get_attribute("datetime")
                 text = time_elem.text.strip()
@@ -406,74 +408,144 @@ def extract_message_data(msg, session, download_dir, driver):
             except:
                 continue
         
-        # 添付ファイルの検出とダウンロード
-        file_selectors = [
-            "a[download]",
-            "[class*='file']",
-            ".cw_message_file",
-            "a[href*='storage.chatwork.com']"
-        ]
-        
-        for selector in file_selectors:
-            try:
-                fresh_msg = get_fresh_element()
-                files = fresh_msg.find_elements(By.CSS_SELECTOR, selector)
-                for file_elem in files:
-                    try:
-                        file_url = file_elem.get_attribute("href") or file_elem.get_attribute("data-url")
-                        file_name = file_elem.text.strip() or file_elem.get_attribute("download") or file_elem.get_attribute("title") or "unknown_file"
-                        
-                        if file_url and 'storage.chatwork.com' in file_url:
-                            local_path = download_file(session, file_url, download_dir, file_name)
-                            
-                            data["attachments"].append({
-                                "type": "file",
-                                "filename": file_name,
-                                "url": file_url,
-                                "local_path": local_path
-                            })
-                    except:
-                        continue
-            except:
-                pass
-        
-        # 画像の検出とダウンロード
+        # ★★★ 1. 画像プレビューの検出（data-file-id対応）★★★
         try:
-            fresh_msg = get_fresh_element()
-            images = fresh_msg.find_elements(By.CSS_SELECTOR, "img[src*='storage.chatwork.com'], img[src*='appdata.chatwork.com']")
-            for i, img in enumerate(images):
-                try:
-                    img_url = img.get_attribute("src")
-                    alt_text = img.get_attribute("alt")
-                    
-                    # アバター画像は除外
-                    if img_url and 'avatar' not in img_url and 'ico_default' not in img_url:
-                        img_name = alt_text or f"image_{data['message_id']}_{i}.jpg"
-                        local_path = download_file(session, img_url, download_dir, img_name)
-                        
-                        data["attachments"].append({
-                            "type": "image",
-                            "filename": img_name,
-                            "url": img_url,
-                            "local_path": local_path
-                        })
-                except:
+            preview_images = msg.find_elements(By.CSS_SELECTOR, "img[data-file-id]._filePreview")
+            
+            for i, img in enumerate(preview_images):
+                file_id = img.get_attribute("data-file-id")
+                src = img.get_attribute("src")
+                
+                print(f"    🖼️ 画像プレビュー検出: file_id={file_id}")
+                
+                # ファイル名を生成
+                filename = f"image_{data['message_id']}_{file_id}.jpg"
+                
+                # 相対パスを絶対URLに変換
+                if src and src.startswith('gateway/'):
+                    src = f"https://www.chatwork.com/{src}"
+                
+                # ダウンロード
+                local_path = download_file_from_chatwork(session, src, filename, download_dir)
+                
+                if local_path:
+                    data["attachments"].append({
+                        "type": "image_preview",
+                        "file_id": file_id,
+                        "filename": filename,
+                        "chatwork_url": src,
+                        "local_absolute_path": local_path
+                    })
+        except Exception as e:
+            print(f"    ⚠️ 画像プレビュー取得エラー: {e}")
+        
+        # ★★★ 2. ファイルダウンロードリンクの検出 ★★★
+        try:
+            file_links = msg.find_elements(By.CSS_SELECTOR, "div[data-cwopen*='download'] a[href*='gateway/download_file.php']")
+            
+            for link in file_links:
+                href = link.get_attribute("href")
+                link_text = link.text.strip()
+                
+                # file_idを抽出
+                file_id_match = re.search(r'file_id=(\d+)', href)
+                file_id = file_id_match.group(1) if file_id_match else "unknown"
+                
+                # ファイル名とサイズを分離（例: "filename.docx (217.83 KB)"）
+                filename_match = re.match(r'(.+?)\s*\([\d.]+\s*[KMGT]?B\)', link_text)
+                if filename_match:
+                    filename = filename_match.group(1).strip()
+                else:
+                    filename = link_text or f"file_{file_id}"
+                
+                print(f"    📎 ファイル検出: {filename} (file_id={file_id})")
+                
+                # 相対パスを絶対URLに変換
+                if href.startswith('gateway/'):
+                    href = f"https://www.chatwork.com/{href}"
+                
+                # ダウンロード
+                local_path = download_file_from_chatwork(session, href, filename, download_dir)
+                
+                if local_path:
+                    data["attachments"].append({
+                        "type": "file",
+                        "file_id": file_id,
+                        "filename": filename,
+                        "chatwork_url": href,
+                        "local_absolute_path": local_path
+                    })
+        except Exception as e:
+            print(f"    ⚠️ ファイルリンク取得エラー: {e}")
+        
+        # ★★★ 3. フォルダ（storage.chatwork.com）の検出 ★★★
+        try:
+            storage_links = msg.find_elements(By.CSS_SELECTOR, "a[href*='storage.chatwork.com']")
+            
+            for link in storage_links:
+                href = link.get_attribute("href")
+                link_text = link.text.strip()
+                title = link.get_attribute("title")
+                download_attr = link.get_attribute("download")
+                
+                # アバター画像を除外
+                if 'avatar' in href or 'ico_default' in href:
                     continue
-        except:
-            pass
+                
+                # ファイル名を取得（優先順位: download属性 > title > リンクテキスト）
+                filename = download_attr or title or link_text
+                
+                # ファイル名がない場合はURLから生成
+                if not filename or filename == "":
+                    filename = f"storage_file_{data['message_id']}"
+                    # URLから拡張子を推測
+                    if '.png' in href or '.jpg' in href or '.jpeg' in href:
+                        filename += '.jpg'
+                    elif '.pdf' in href:
+                        filename += '.pdf'
+                    elif '.xlsx' in href or '.xls' in href:
+                        filename += '.xlsx'
+                    elif '.docx' in href:
+                        filename += '.docx'
+                
+                print(f"    📁 ストレージファイル検出: {filename}")
+                
+                # ダウンロード
+                local_path = download_file_from_chatwork(session, href, filename, download_dir)
+                
+                if local_path:
+                    data["attachments"].append({
+                        "type": "storage_file",
+                        "filename": filename,
+                        "chatwork_url": href,
+                        "local_absolute_path": local_path
+                    })
+        except Exception as e:
+            print(f"    ⚠️ ストレージファイル取得エラー: {e}")
         
         # タスク判定
         try:
-            fresh_msg = get_fresh_element()
-            fresh_msg.find_element(By.CSS_SELECTOR, "[data-test='task-icon'], .taskIcon, [class*='task']")
+            msg.find_element(By.CSS_SELECTOR, "[data-test='task-icon'], .taskIcon, [class*='task']")
             data["is_task"] = True
         except:
             pass
         
     except Exception as e:
-        print(f"  ⚠️  メッセージ解析エラー (mid:{data['message_id']}): {e}")
+        print(f"  ⚠️  メッセージ解析エラー: {e}")
+        import traceback
+        traceback.print_exc()
     
     return data
+
+def is_room_already_processed(room_id, room_name, base_download_dir):
+    """★★★ ルームが既に処理済みか確認 ★★★"""
+    safe_room_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in room_name)
+    safe_room_name = safe_room_name.strip()[:50]
+    
+    # JSONファイルが存在するか確認
+    filename = Path(base_download_dir) / f"{room_id}_{safe_room_name}.json"
+    
+    return filename.exists(), filename
 
 def export_room_messages(driver, room_url, session, base_download_dir):
     """特定ルームの全メッセージを取得"""
@@ -483,6 +555,7 @@ def export_room_messages(driver, room_url, session, base_download_dir):
     room_id = room_url.split("rid")[-1]
     room_name = f"Room_{room_id}"
     
+    # ルーム名を取得
     room_name_selectors = [
         ".chatRoomHeader__roomTitle",
         "span.chatRoomHeader__roomTitle",
@@ -512,18 +585,33 @@ def export_room_messages(driver, room_url, session, base_download_dir):
         print(f"\n📁 ルーム: {room_name} (ID: {room_id})")
         print(f"  ⚠️ ルーム名取得失敗: {e}")
     
+    # ★★★ ターゲットキーワードフィルター ★★★
+    if not is_room_target(room_name):
+        print(f"⏭️  スキップ: ターゲットキーワードに一致していません")
+        print(f"   ルーム名: {room_name}")
+        print(f"   対象キーワード: {', '.join(TARGET_KEYWORDS)}")
+        return None
+    
+    # ★★★ 処理済みチェック ★★★
+    already_processed, json_file = is_room_already_processed(room_id, room_name, base_download_dir)
+    if already_processed:
+        print(f"⏭️  スキップ: このルームは既に処理済みです")
+        print(f"   ファイル: {json_file.name}")
+        print(f"   💡 再処理したい場合はこのファイルを削除してください")
+        return None
+    
+    # ファイル名用に安全な文字列に変換
     safe_room_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in room_name)
     safe_room_name = safe_room_name.strip()[:50]
     
+    # このルーム専用のダウンロードディレクトリ
     download_dir = Path(base_download_dir) / f"{room_id}_{safe_room_name}"
     download_dir.mkdir(parents=True, exist_ok=True)
     
+    # 全メッセージを読み込み
     scroll_to_load_all_messages(driver)
     
-    # スクロール後にセッションを更新
-    print("  🔄 データ取得前にセッション更新...")
-    session = get_session_cookies(driver)
-    
+    # メッセージ要素を取得
     message_selectors = [
         "div[data-mid]",
         "li[data-mid]",
@@ -544,16 +632,9 @@ def export_room_messages(driver, room_url, session, base_download_dir):
     print(f"📥 メッセージとファイルを処理中...")
     
     extracted_messages = []
-    message_refresh_interval = 100  # 100件ごとにセッション更新
-    
     for i, msg in enumerate(messages, 1):
         if i % 50 == 0:
             print(f"  {i}/{len(messages)} 件処理完了...")
-        
-        # 定期的にセッション更新
-        if i > 0 and i % message_refresh_interval == 0:
-            print(f"  🔄 処理中断防止のためセッション更新...")
-            session = get_session_cookies(driver)
         
         data = extract_message_data(msg, session, download_dir)
         extracted_messages.append(data)
@@ -564,20 +645,16 @@ def export_room_messages(driver, room_url, session, base_download_dir):
         "room_url": room_url,
         "export_date": datetime.now().isoformat(),
         "total_messages": len(extracted_messages),
-        "download_directory": str(download_dir),
+        "download_directory": str(download_dir.resolve()),
         "messages": extracted_messages
     }
 
 def main():
+    # ダウンロード先ディレクトリ
     BASE_DOWNLOAD_DIR = "chatwork_backup"
     Path(BASE_DOWNLOAD_DIR).mkdir(exist_ok=True)
     
-    print("\n" + "="*60)
-    print("🎯 Chatwork 特定ルームバックアップツール")
-    print("="*60)
-    print(f"対象キーワード: {', '.join(TARGET_KEYWORDS)}")
-    print("="*60 + "\n")
-    
+    # Chromeドライバーを起動
     options = webdriver.ChromeOptions()
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--start-maximized")
@@ -585,54 +662,70 @@ def main():
     driver = webdriver.Chrome(options=options)
     
     try:
+        # ログイン（手動）
         login_chatwork(driver)
+        
+        # セッションCookieを取得
         session = get_session_cookies(driver)
+        
+        # 全ルームURLを自動取得
         room_urls = get_all_room_urls(driver)
         
         if not room_urls:
-            print("❌ 対象ルームが見つかりませんでした")
+            print("❌ ルームが見つかりませんでした")
             return
         
+        # 各ルームのメッセージを取得
         all_exports = []
-        processed_count = 0
+        skipped_count = 0
         
         for i, room_url in enumerate(room_urls, 1):
             print(f"\n{'='*60}")
             print(f"ルーム {i}/{len(room_urls)} を処理中")
             print(f"{'='*60}")
             
-            # 各ルーム処理前にセッション更新
-            if processed_count > 0:
-                print("🔄 次のルームへ移動前にセッション更新...")
-                refresh_session(driver)
+            # セッション確認・再ログイン
+            session = relogin_if_needed(driver, session)
             
             room_data = export_room_messages(driver, room_url, session, BASE_DOWNLOAD_DIR)
             
             if room_data:
                 all_exports.append(room_data)
-                processed_count += 1
                 
+                # ファイル名用に安全な文字列を作成
                 safe_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in room_data['room_name'])
                 safe_name = safe_name.strip()[:50]
                 
+                # ルームごとに個別保存
                 filename = Path(BASE_DOWNLOAD_DIR) / f"{room_data['room_id']}_{safe_name}.json"
                 with open(filename, "w", encoding="utf-8") as f:
                     json.dump(room_data, f, ensure_ascii=False, indent=2)
                 
                 print(f"✅ {filename.name} に保存しました")
+            else:
+                skipped_count += 1
             
             time.sleep(3)
         
-        master_filename = Path(BASE_DOWNLOAD_DIR) / f"_all_rooms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(master_filename, "w", encoding="utf-8") as f:
-            json.dump(all_exports, f, ensure_ascii=False, indent=2)
-        
-        print(f"\n{'='*60}")
-        print(f"✅ 全ルームのエクスポート完了")
-        print(f"   統合ファイル: {master_filename}")
-        print(f"   ダウンロード先: {BASE_DOWNLOAD_DIR}/")
-        print(f"   処理ルーム数: {len(all_exports)}")
-        print(f"{'='*60}")
+        # 全ルームをまとめて保存
+        if all_exports:
+            master_filename = Path(BASE_DOWNLOAD_DIR) / f"_all_rooms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(master_filename, "w", encoding="utf-8") as f:
+                json.dump(all_exports, f, ensure_ascii=False, indent=2)
+            
+            print(f"\n{'='*60}")
+            print(f"✅ 全ルームのエクスポート完了")
+            print(f"   統合ファイル: {master_filename.resolve()}")
+            print(f"   ダウンロード先: {Path(BASE_DOWNLOAD_DIR).resolve()}/")
+            print(f"   処理ルーム数: {len(all_exports)}")
+            print(f"   スキップ数: {skipped_count}")
+            print(f"{'='*60}")
+        else:
+            print(f"\n{'='*60}")
+            print(f"✅ 全ルーム確認完了")
+            print(f"   対象ルームがありません（スキップ: {skipped_count}）")
+            print(f"   対象キーワード: {', '.join(TARGET_KEYWORDS)}")
+            print(f"{'='*60}")
         
     except Exception as e:
         print(f"\n❌ エラーが発生しました: {e}")
