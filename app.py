@@ -2,20 +2,18 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import StaleElementReferenceException, NoSuchElementException
 import time
 import json
 import os
 import requests
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+import re
 
 # フィルター対象のキーワード
 TARGET_KEYWORDS = [
-    "マイチャット","吉田", "金森", "藤田", "原", "プログラミングチーム", "加藤", 
-    "野坂", "森田", "大谷", "村上", "斎藤", "備品発注管理", "北館", 
-    "社員連絡", "金山", "めぐみる", "鈴木", "浅井", "白石", "山田", 
-    "藤原", "堀田"
+    "森田"
 ]
 
 def should_process_room(room_name):
@@ -101,30 +99,34 @@ def get_all_room_urls(driver):
         except:
             continue
     
-    # data-rid からURLとルーム名を取得
+    # data-rid からURLとルーム名を取得（Stale対策：即座にデータ抽出）
     room_data = []
     
     if room_elements:
         for elem in room_elements:
-            rid = elem.get_attribute("data-rid")
-            if rid:
-                # ChatworkのURL形式でURLを生成
-                room_url = f"https://www.chatwork.com/#!rid{rid}"
-                
-                # ルーム名を取得
-                room_name = "Unknown"
-                try:
-                    label = elem.get_attribute("aria-label")
-                    if label:
-                        room_name = label
-                except:
-                    pass
-                
-                room_data.append({
-                    "url": room_url,
-                    "name": room_name,
-                    "rid": rid
-                })
+            try:
+                rid = elem.get_attribute("data-rid")
+                if rid:
+                    # ChatworkのURL形式でURLを生成
+                    room_url = f"https://www.chatwork.com/#!rid{rid}"
+                    
+                    # ルーム名を取得
+                    room_name = "Unknown"
+                    try:
+                        label = elem.get_attribute("aria-label")
+                        if label:
+                            room_name = label
+                    except:
+                        pass
+                    
+                    room_data.append({
+                        "url": room_url,
+                        "name": room_name,
+                        "rid": rid
+                    })
+            except StaleElementReferenceException:
+                # 古い要素になった場合はスキップ
+                continue
     
     # 旧UIにも対応（念のため）
     if not room_data:
@@ -141,15 +143,18 @@ def get_all_room_urls(driver):
                 if links:
                     print(f"    ✓ {selector}: {len(links)}個検出")
                     for link in links:
-                        href = link.get_attribute("href")
-                        name = link.text.strip() or "Unknown"
-                        if href and "rid" in href:
-                            rid = href.split("rid")[-1]
-                            room_data.append({
-                                "url": href,
-                                "name": name,
-                                "rid": rid
-                            })
+                        try:
+                            href = link.get_attribute("href")
+                            name = link.text.strip() or "Unknown"
+                            if href and "rid" in href:
+                                rid = href.split("rid")[-1]
+                                room_data.append({
+                                    "url": href,
+                                    "name": name,
+                                    "rid": rid
+                                })
+                        except StaleElementReferenceException:
+                            continue
             except:
                 continue
     
@@ -197,39 +202,32 @@ def get_session_cookies(driver):
     
     return session
 
-def refresh_session(driver):
-    """セッションを更新してタイムアウトを防ぐ"""
-    try:
-        # 現在のURLを保存
-        current_url = driver.current_url
-        
-        # トップページに移動してセッション更新
-        driver.get("https://www.chatwork.com/")
-        time.sleep(2)
-        
-        # 元のページに戻る
-        driver.get(current_url)
-        time.sleep(2)
-        
-        print("  🔄 セッション更新完了")
-    except Exception as e:
-        print(f"  ⚠️  セッション更新エラー: {e}")
 
-def download_file(session, url, save_dir, filename):
-    """添付ファイルをダウンロード"""
+
+def download_file_from_chatwork(session, file_url, filename, save_dir):
+    """Chatworkからファイルをダウンロード（相対パス対応）"""
     try:
-        save_path = Path(save_dir) / filename
+        # 相対パスを絶対パスに変換
+        if file_url.startswith('gateway/'):
+            file_url = f"https://www.chatwork.com/{file_url}"
+        
+        # ファイル名をサニタイズ（Windowsで使えない文字を除去）
+        safe_filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        
+        save_path = Path(save_dir) / safe_filename
         save_path.parent.mkdir(parents=True, exist_ok=True)
         
-        response = session.get(url, stream=True, timeout=30)
+        response = session.get(file_url, stream=True, timeout=30)
         response.raise_for_status()
         
         with open(save_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         
-        print(f"    ✓ ダウンロード: {filename}")
-        return str(save_path)
+        # 絶対パスを返す
+        absolute_path = str(save_path.resolve())
+        print(f"    ✓ ダウンロード: {safe_filename}")
+        return absolute_path
     except Exception as e:
         print(f"    ✗ ダウンロード失敗 ({filename}): {e}")
         return None
@@ -268,24 +266,40 @@ def scroll_to_load_all_messages(driver):
     no_change_count = 0
     max_attempts = 100
     wait_time = 2.5
-    session_refresh_interval = 50
     
     print(f"  スクロール開始（最大{max_attempts}回試行）...")
     
     for i in range(max_attempts):
-        # 定期的にセッション更新
-        if i > 0 and i % session_refresh_interval == 0:
-            print(f"  ⏱️  長時間処理中 - セッション更新...")
-            refresh_session(driver)
+        # 現在のメッセージ数を取得（Stale対策：毎回再取得）
+        try:
+            messages = driver.find_elements(By.CSS_SELECTOR, "[data-mid]")
+            current_count = len(messages)
+        except:
+            print(f"    ⚠️ メッセージ取得エラー、再試行...")
+            time.sleep(1)
+            continue
         
-        messages = driver.find_elements(By.CSS_SELECTOR, "[data-mid]")
-        current_count = len(messages)
+        # チャットエリアを再取得（Stale対策）
+        try:
+            for selector in selectors:
+                try:
+                    chat_area = driver.find_element(By.CSS_SELECTOR, selector)
+                    break
+                except:
+                    continue
+            
+            driver.execute_script("arguments[0].scrollTop = 0", chat_area)
+        except:
+            print(f"    ⚠️ スクロールエラー、続行...")
         
-        driver.execute_script("arguments[0].scrollTop = 0", chat_area)
         time.sleep(wait_time)
         
-        messages_after_wait = driver.find_elements(By.CSS_SELECTOR, "[data-mid]")
-        count_after_wait = len(messages_after_wait)
+        # スクロール後のメッセージ数を再取得
+        try:
+            messages_after_wait = driver.find_elements(By.CSS_SELECTOR, "[data-mid]")
+            count_after_wait = len(messages_after_wait)
+        except:
+            count_after_wait = current_count
         
         if count_after_wait == previous_message_count:
             no_change_count += 1
@@ -305,16 +319,51 @@ def scroll_to_load_all_messages(driver):
     if no_change_count < 7:
         print(f"  ⚠️ 最大試行回数に達しました ({previous_message_count}件取得）")
     
-    driver.execute_script("arguments[0].scrollTop = 0", chat_area)
+    # 最後に一番上にスクロール
+    try:
+        for selector in selectors:
+            try:
+                chat_area = driver.find_element(By.CSS_SELECTOR, selector)
+                driver.execute_script("arguments[0].scrollTop = 0", chat_area)
+                break
+            except:
+                continue
+    except:
+        pass
+    
     time.sleep(2)
     
     final_count = len(driver.find_elements(By.CSS_SELECTOR, "[data-mid]"))
     print(f"  📊 最終取得件数: {final_count}件")
 
-def extract_message_data(msg, session, download_dir, driver):
-    """個別メッセージからデータを抽出"""
+def safe_get_text(element, max_retries=3):
+    """Stale対策：要素からテキストを安全に取得"""
+    for attempt in range(max_retries):
+        try:
+            return element.text.strip()
+        except StaleElementReferenceException:
+            if attempt < max_retries - 1:
+                time.sleep(0.1)
+                continue
+            return ""
+    return ""
+
+def safe_get_attribute(element, attr_name, max_retries=3):
+    """Stale対策：要素から属性を安全に取得"""
+    for attempt in range(max_retries):
+        try:
+            return element.get_attribute(attr_name)
+        except StaleElementReferenceException:
+            if attempt < max_retries - 1:
+                time.sleep(0.1)
+                continue
+            return None
+    return None
+
+def extract_message_data_by_id(driver, message_id, session, download_dir):
+    """message_idを使って都度要素を再取得しながらデータ抽出（添付ファイル完全対応）"""
     data = {
-        "message_id": None,
+        "message_id": message_id,
         "sender": "Unknown",
         "company": "",
         "body": "",
@@ -323,16 +372,15 @@ def extract_message_data(msg, session, download_dir, driver):
         "is_task": False
     }
     
+    def get_fresh_message():
+        """常に最新のメッセージ要素を取得"""
+        try:
+            return driver.find_element(By.CSS_SELECTOR, f"[data-mid='{message_id}']")
+        except NoSuchElementException:
+            return None
+    
     try:
-        data["message_id"] = msg.get_attribute("data-mid")
-        
-        def get_fresh_element():
-            try:
-                return driver.find_element(By.CSS_SELECTOR, f"[data-mid='{data['message_id']}']")
-            except:
-                return msg
-        
-        # 送信者名（新UI対応）
+        # 送信者名
         sender_selectors = [
             "[data-testid='timeline_user-name']",
             "p[data-testid='timeline_user-name']",
@@ -342,23 +390,26 @@ def extract_message_data(msg, session, download_dir, driver):
         ]
         for selector in sender_selectors:
             try:
-                fresh_msg = get_fresh_element()
-                sender = fresh_msg.find_element(By.CSS_SELECTOR, selector)
-                data["sender"] = sender.text.strip()
-                if data["sender"]:
-                    break
-            except:
+                msg = get_fresh_message()
+                if msg:
+                    sender = msg.find_element(By.CSS_SELECTOR, selector)
+                    sender_text = safe_get_text(sender)
+                    if sender_text:
+                        data["sender"] = sender_text
+                        break
+            except (NoSuchElementException, StaleElementReferenceException):
                 continue
         
-        # 会社名・所属（新UI）
+        # 会社名・所属
         try:
-            fresh_msg = get_fresh_element()
-            company_elem = fresh_msg.find_element(By.CSS_SELECTOR, ".sc-fjhLSj")
-            data["company"] = company_elem.text.strip()
+            msg = get_fresh_message()
+            if msg:
+                company_elem = msg.find_element(By.CSS_SELECTOR, ".sc-fjhLSj")
+                data["company"] = safe_get_text(company_elem)
         except:
             pass
         
-        # メッセージ本文（新UI対応）
+        # メッセージ本文
         body_selectors = [
             "pre.sc-fbFiXs",
             "pre span",
@@ -368,15 +419,17 @@ def extract_message_data(msg, session, download_dir, driver):
         ]
         for selector in body_selectors:
             try:
-                fresh_msg = get_fresh_element()
-                body = fresh_msg.find_element(By.CSS_SELECTOR, selector)
-                data["body"] = body.text.strip()
-                if data["body"]:
-                    break
-            except:
+                msg = get_fresh_message()
+                if msg:
+                    body = msg.find_element(By.CSS_SELECTOR, selector)
+                    body_text = safe_get_text(body)
+                    if body_text:
+                        data["body"] = body_text
+                        break
+            except (NoSuchElementException, StaleElementReferenceException):
                 continue
         
-        # タイムスタンプ（新UI対応）
+        # タイムスタンプ
         time_selectors = [
             "._timeStamp",
             "[data-tm]",
@@ -386,90 +439,149 @@ def extract_message_data(msg, session, download_dir, driver):
         ]
         for selector in time_selectors:
             try:
-                fresh_msg = get_fresh_element()
-                time_elem = fresh_msg.find_element(By.CSS_SELECTOR, selector)
-                data_tm = time_elem.get_attribute("data-tm")
-                datetime_attr = time_elem.get_attribute("datetime")
-                text = time_elem.text.strip()
-                
-                if datetime_attr:
-                    data["timestamp"] = datetime_attr
-                elif data_tm:
-                    data["timestamp"] = f"unix:{data_tm}"
-                elif text:
-                    data["timestamp"] = text
-                
-                if data["timestamp"]:
-                    break
-            except:
+                msg = get_fresh_message()
+                if msg:
+                    time_elem = msg.find_element(By.CSS_SELECTOR, selector)
+                    data_tm = safe_get_attribute(time_elem, "data-tm")
+                    datetime_attr = safe_get_attribute(time_elem, "datetime")
+                    text = safe_get_text(time_elem)
+                    
+                    if datetime_attr:
+                        data["timestamp"] = datetime_attr
+                    elif data_tm:
+                        data["timestamp"] = f"unix:{data_tm}"
+                    elif text:
+                        data["timestamp"] = text
+                    
+                    if data["timestamp"]:
+                        break
+            except (NoSuchElementException, StaleElementReferenceException):
                 continue
         
-        # 添付ファイルの検出とダウンロード
-        file_selectors = [
-            "a[download]",
-            "[class*='file']",
-            ".cw_message_file",
-            "a[href*='storage.chatwork.com']"
-        ]
-        
-        for selector in file_selectors:
-            try:
-                fresh_msg = get_fresh_element()
-                files = fresh_msg.find_elements(By.CSS_SELECTOR, selector)
-                for file_elem in files:
-                    try:
-                        file_url = file_elem.get_attribute("href") or file_elem.get_attribute("data-url")
-                        file_name = file_elem.text.strip() or file_elem.get_attribute("download") or file_elem.get_attribute("title") or "unknown_file"
+        # ★★★ 1. 画像プレビューの検出（data-file-id対応）★★★
+        try:
+            msg = get_fresh_message()
+            if msg:
+                preview_images = msg.find_elements(By.CSS_SELECTOR, "img[data-file-id]._filePreview")
+                
+                for i, img in enumerate(preview_images):
+                    file_id = safe_get_attribute(img, "data-file-id")
+                    src = safe_get_attribute(img, "src")
+                    
+                    if file_id:
+                        print(f"    🖼️ 画像プレビュー検出: file_id={file_id}")
                         
-                        if file_url and 'storage.chatwork.com' in file_url:
-                            local_path = download_file(session, file_url, download_dir, file_name)
-                            
+                        filename = f"image_{message_id}_{file_id}.jpg"
+                        
+                        if src and src.startswith('gateway/'):
+                            src = f"https://www.chatwork.com/{src}"
+                        
+                        local_path = download_file_from_chatwork(session, src, filename, download_dir)
+                        
+                        if local_path:
+                            data["attachments"].append({
+                                "type": "image_preview",
+                                "file_id": file_id,
+                                "filename": filename,
+                                "chatwork_url": src,
+                                "local_absolute_path": local_path
+                            })
+        except Exception as e:
+            print(f"    ⚠️ 画像プレビュー取得エラー: {e}")
+        
+        # ★★★ 2. ファイルダウンロードリンクの検出 ★★★
+        try:
+            msg = get_fresh_message()
+            if msg:
+                file_links = msg.find_elements(By.CSS_SELECTOR, "div[data-cwopen*='download'] a[href*='gateway/download_file.php']")
+                
+                for link in file_links:
+                    href = safe_get_attribute(link, "href")
+                    link_text = safe_get_text(link)
+                    
+                    file_id_match = re.search(r'file_id=(\d+)', href) if href else None
+                    file_id = file_id_match.group(1) if file_id_match else "unknown"
+                    
+                    filename_match = re.match(r'(.+?)\s*\([\d.]+\s*[KMGT]?B\)', link_text) if link_text else None
+                    if filename_match:
+                        filename = filename_match.group(1).strip()
+                    else:
+                        filename = link_text or f"file_{file_id}"
+                    
+                    if href:
+                        print(f"    📎 ファイル検出: {filename} (file_id={file_id})")
+                        
+                        if href.startswith('gateway/'):
+                            href = f"https://www.chatwork.com/{href}"
+                        
+                        local_path = download_file_from_chatwork(session, href, filename, download_dir)
+                        
+                        if local_path:
                             data["attachments"].append({
                                 "type": "file",
-                                "filename": file_name,
-                                "url": file_url,
-                                "local_path": local_path
+                                "file_id": file_id,
+                                "filename": filename,
+                                "chatwork_url": href,
+                                "local_absolute_path": local_path
                             })
-                    except:
-                        continue
-            except:
-                pass
+        except Exception as e:
+            print(f"    ⚠️ ファイルリンク取得エラー: {e}")
         
-        # 画像の検出とダウンロード
+        # ★★★ 3. ストレージファイルの検出 ★★★
         try:
-            fresh_msg = get_fresh_element()
-            images = fresh_msg.find_elements(By.CSS_SELECTOR, "img[src*='storage.chatwork.com'], img[src*='appdata.chatwork.com']")
-            for i, img in enumerate(images):
-                try:
-                    img_url = img.get_attribute("src")
-                    alt_text = img.get_attribute("alt")
+            msg = get_fresh_message()
+            if msg:
+                storage_links = msg.find_elements(By.CSS_SELECTOR, "a[href*='storage.chatwork.com']")
+                
+                for link in storage_links:
+                    href = safe_get_attribute(link, "href")
+                    link_text = safe_get_text(link)
+                    title = safe_get_attribute(link, "title")
+                    download_attr = safe_get_attribute(link, "download")
                     
-                    # アバター画像は除外
-                    if img_url and 'avatar' not in img_url and 'ico_default' not in img_url:
-                        img_name = alt_text or f"image_{data['message_id']}_{i}.jpg"
-                        local_path = download_file(session, img_url, download_dir, img_name)
+                    if href and ('avatar' in href or 'ico_default' in href):
+                        continue
+                    
+                    filename = download_attr or title or link_text
+                    
+                    if not filename or filename == "":
+                        filename = f"storage_file_{message_id}"
+                        if href:
+                            if '.png' in href or '.jpg' in href or '.jpeg' in href:
+                                filename += '.jpg'
+                            elif '.pdf' in href:
+                                filename += '.pdf'
+                            elif '.xlsx' in href or '.xls' in href:
+                                filename += '.xlsx'
+                            elif '.docx' in href:
+                                filename += '.docx'
+                    
+                    if href:
+                        print(f"    📁 ストレージファイル検出: {filename}")
                         
-                        data["attachments"].append({
-                            "type": "image",
-                            "filename": img_name,
-                            "url": img_url,
-                            "local_path": local_path
-                        })
-                except:
-                    continue
-        except:
-            pass
+                        local_path = download_file_from_chatwork(session, href, filename, download_dir)
+                        
+                        if local_path:
+                            data["attachments"].append({
+                                "type": "storage_file",
+                                "filename": filename,
+                                "chatwork_url": href,
+                                "local_absolute_path": local_path
+                            })
+        except Exception as e:
+            print(f"    ⚠️ ストレージファイル取得エラー: {e}")
         
         # タスク判定
         try:
-            fresh_msg = get_fresh_element()
-            fresh_msg.find_element(By.CSS_SELECTOR, "[data-test='task-icon'], .taskIcon, [class*='task']")
-            data["is_task"] = True
+            msg = get_fresh_message()
+            if msg:
+                msg.find_element(By.CSS_SELECTOR, "[data-test='task-icon'], .taskIcon, [class*='task']")
+                data["is_task"] = True
         except:
             pass
         
     except Exception as e:
-        print(f"  ⚠️  メッセージ解析エラー (mid:{data['message_id']}): {e}")
+        print(f"  ⚠️  メッセージ解析エラー (mid:{message_id}): {e}")
     
     return data
 
@@ -516,9 +628,12 @@ def export_room_messages(driver, room_url, session, base_download_dir):
     
     scroll_to_load_all_messages(driver)
     
-    # スクロール後にセッションを更新
-    print("  🔄 データ取得前にセッション更新...")
+    # データ取得用のセッションを準備
     session = get_session_cookies(driver)
+    
+    # メッセージIDのリストを最初に取得（Stale対策の核心）
+    print("  📋 メッセージIDリストを取得中...")
+    message_ids = []
     
     message_selectors = [
         "div[data-mid]",
@@ -526,32 +641,38 @@ def export_room_messages(driver, room_url, session, base_download_dir):
         "[data-test='message-item']"
     ]
     
-    messages = []
     for selector in message_selectors:
-        messages = driver.find_elements(By.CSS_SELECTOR, selector)
-        if messages:
-            print(f"  {len(messages)}件のメッセージを検出")
-            break
+        try:
+            messages = driver.find_elements(By.CSS_SELECTOR, selector)
+            if messages:
+                print(f"  {len(messages)}件のメッセージを検出")
+                # IDだけ先に全て抽出（要素参照は保持しない）
+                for msg in messages:
+                    try:
+                        mid = safe_get_attribute(msg, "data-mid")
+                        if mid:
+                            message_ids.append(mid)
+                    except:
+                        continue
+                break
+        except:
+            continue
     
-    if not messages:
+    if not message_ids:
         print("❌ メッセージが見つかりません")
         return None
     
-    print(f"📥 メッセージとファイルを処理中...")
+    print(f"📥 {len(message_ids)}件のメッセージとファイルを処理中...")
     
     extracted_messages = []
-    message_refresh_interval = 100
     
-    for i, msg in enumerate(messages, 1):
+    # IDベースで処理（Stale問題を根本解決）
+    for i, message_id in enumerate(message_ids, 1):
         if i % 50 == 0:
-            print(f"  {i}/{len(messages)} 件処理完了...")
+            print(f"  {i}/{len(message_ids)} 件処理完了...")
         
-        # 定期的にセッション更新
-        if i > 0 and i % message_refresh_interval == 0:
-            print(f"  🔄 処理中断防止のためセッション更新...")
-            session = get_session_cookies(driver)
-        
-        data = extract_message_data(msg, session, download_dir, driver)
+        # 各メッセージごとに新鮮な要素を取得して処理
+        data = extract_message_data_by_id(driver, message_id, session, download_dir)
         extracted_messages.append(data)
     
     return {
@@ -596,11 +717,6 @@ def main():
             print(f"\n{'='*60}")
             print(f"ルーム {i}/{len(room_urls)} を処理中")
             print(f"{'='*60}")
-            
-            # 各ルーム処理前にセッション更新
-            if processed_count > 0:
-                print("🔄 次のルームへ移動前にセッション更新...")
-                refresh_session(driver)
             
             room_data = export_room_messages(driver, room_url, session, BASE_DOWNLOAD_DIR)
             
